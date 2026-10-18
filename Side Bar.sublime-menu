@@ -1,0 +1,7 @@
+[
+	{
+		"caption": "File/Folder Stats",
+		"command": "file_dir_stats",
+		"args": {"paths": []}
+	}
+]
