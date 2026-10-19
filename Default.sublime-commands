@@ -1,3 +1,5 @@
 [
-	{"caption": "FileDirStats: Stats of This File", "command": "file_dir_stats"}
+	{"caption": "FileDirStats: Stats of This File", "command": "file_dir_stats"},
+	{"caption": "FileDirStats: Refresh", "command": "file_dir_stats_refresh"},
+	{"caption": "FileDirStats: Toggle Auto Refresh", "command": "file_dir_stats_auto_refresh"}
 ]
