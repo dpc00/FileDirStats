@@ -20,7 +20,7 @@ _running = {}  # window id -> cancel Event of the run in progress
 _last = {}     # window id -> (paths, list of Stats, cancel Event) of the latest run
 _auto = {}     # window id -> seconds between refreshes while auto refresh is on
 _tickets = {}  # window id -> token of the auto refresh timer chain that may keep running
-_phantoms = {}  # view id -> PhantomSet; a phantom is dropped when its set is garbage collected
+_phantom_sets = {}  # view id -> PhantomSet; a phantom is dropped when its set is garbage collected
 
 
 def human(n):
@@ -50,7 +50,7 @@ def plugin_unloaded():
     """Stop timers and walks of this module instance; a reload would otherwise leave them running."""
     _auto.clear()
     _tickets.clear()
-    _phantoms.clear()
+    _phantom_sets.clear()
     for cancel in _running.values():
         cancel.set()
 
@@ -84,8 +84,32 @@ class Stats:
             heapq.heappushpop(self.largest, (size, path))
 
 
+def extended(path):
+    """Windows: the \\\\?\\ form lets scandir go past the 260 character path limit."""
+    if os.name != "nt" or path.startswith("\\\\?\\"):
+        return path
+    if path.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + path[2:]
+    return "\\\\?\\" + os.path.abspath(path)
+
+
+def plain(path):
+    """Undo extended(), for display."""
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
+
+
+def reason(err):
+    """What went wrong without repeating the path, which the log line already shows."""
+    winerror = getattr(err, "winerror", None)
+    return "[WinError %s] %s" % (winerror, err.strerror) if winerror else str(err.strerror or err)
+
+
 def walk(stats, cancel):
-    stack = [stats.path]
+    stack = [extended(stats.path)]
     while stack and not cancel.is_set():
         folder = stack.pop()
         try:
@@ -97,21 +121,21 @@ def walk(stats, cancel):
                         st = e.stat(follow_symlinks=False)
                         if e.is_symlink() or getattr(st, "st_file_attributes", 0) & REPARSE_POINT:
                             stats.skipped += 1
-                            stats.note("SKIP", e.path, "link or junction, not followed")
+                            stats.note("SKIP", plain(e.path), "link or junction, not followed")
                         elif e.is_dir(follow_symlinks=False):
                             stats.dirs += 1
                             stack.append(e.path)
                         else:
-                            stats.add_file(st.st_size, st.st_mtime, e.path)
+                            stats.add_file(st.st_size, st.st_mtime, plain(e.path))
                     except OSError as err:
-                        stats.note("ERROR", e.path, err)
+                        stats.note("ERROR", plain(e.path), reason(err))
         except OSError as err:
-            stats.note("ERROR", folder, err)
+            stats.note("ERROR", plain(folder), reason(err))
 
 
 def work(stats, cancel):
     try:
-        stats.st = os.stat(stats.path)
+        stats.st = os.stat(extended(stats.path))
         stats.is_dir = stat.S_ISDIR(stats.st.st_mode)
         if stats.is_dir:
             walk(stats, cancel)
@@ -170,20 +194,20 @@ def render(stats, cancelled=False):
 CSS = (
     "<style>"
     "h3{margin:0 0 2px 0;color:#66d9ef;}"
-    ".path{color:#75715e;font-size:11px;margin-bottom:6px;}"
+    ".path{color:#c8c8c0;font-size:11px;margin-bottom:6px;}"
     ".bar{margin:0 0 14px 0;}"
     ".btn{color:#a6e22e;text-decoration:none;font-weight:bold;}"
-    ".off{color:#75715e;text-decoration:none;font-weight:bold;}"
-    ".danger{color:#f92672;text-decoration:none;font-weight:bold;}"
-    ".k{color:#75715e;display:inline-block;width:90px;}"
+    ".off{color:#c8c8c0;text-decoration:none;font-weight:bold;}"
+    ".danger{color:#ff6188;text-decoration:none;font-weight:bold;}"
+    ".k{color:#c8c8c0;display:inline-block;width:90px;}"
     ".v{color:#f8f8f2;}"
     ".card{margin-bottom:18px;}"
     ".sec{color:#66d9ef;margin:10px 0 4px 0;font-weight:bold;}"
-    ".sz{color:#e6db74;font-weight:bold;}"
-    ".fp{color:#75715e;font-size:11px;margin-bottom:5px;}"
-    ".err{color:#f92672;font-size:11px;}"
-    ".skip{color:#e6db74;font-size:11px;}"
-    ".hint{color:#75715e;font-size:11px;margin-top:6px;}"
+    ".sz{color:#ffd866;font-weight:bold;}"
+    ".fp{color:#c8c8c0;font-size:11px;margin-bottom:5px;}"
+    ".err{color:#ff6188;font-size:11px;}"
+    ".skip{color:#ffd866;font-size:11px;}"
+    ".hint{color:#c8c8c0;font-size:11px;margin-top:6px;}"
     "</style>"
 )
 
@@ -299,9 +323,9 @@ def is_shown(window, view):
 def draw(view, all_stats, cancel):
     window = view.window()
     auto = _auto.get(window.id(), 0) if window else 0
-    phantom_set = _phantoms.get(view.id())
+    phantom_set = _phantom_sets.get(view.id())
     if phantom_set is None:
-        phantom_set = _phantoms[view.id()] = sublime.PhantomSet(view, "file_dir_stats")
+        phantom_set = _phantom_sets[view.id()] = sublime.PhantomSet(view, "file_dir_stats")
     phantom_set.update([sublime.Phantom(sublime.Region(0, 0), page(all_stats, cancel.is_set(), auto),
                                         sublime.LAYOUT_BLOCK, lambda href: navigate(view, href))])
 
