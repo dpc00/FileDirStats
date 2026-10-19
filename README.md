@@ -16,3 +16,11 @@ Command palette:
 - "FileDirStats: Refresh" runs the latest stats again on the same paths.
 - "FileDirStats: Toggle Auto Refresh" refreshes every 10 seconds (argument `seconds`)
   while the stats panel is open and the previous run has finished.
+
+## Install
+
+Clone or copy this folder into Sublime Text's `Packages` folder (Preferences > Browse Packages).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
