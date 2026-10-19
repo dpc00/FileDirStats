@@ -17,10 +17,9 @@ REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: junctions and symlinks on
 
 AUTO_SECONDS = 10
 
-_running = {}  # window id -> cancel Event of the run in progress
-_last = {}     # window id -> (paths, list of Stats, cancel Event) of the latest run
-_auto = {}     # window id -> seconds between refreshes while auto refresh is on
-_tickets = {}  # window id -> token of the auto refresh timer chain that may keep running
+_run = None     # the latest Run; there is one stats window, so the state is global
+_auto = 0       # seconds between refreshes while auto refresh is on, 0 when off
+_ticket = None  # token of the auto refresh timer chain that may keep running
 _phantom_sets = {}  # view id -> PhantomSet; a phantom is dropped when its set is garbage collected
 
 
@@ -49,11 +48,11 @@ def created_line(st):
 
 def plugin_unloaded():
     """Stop timers and walks of this module instance; a reload would otherwise leave them running."""
-    _auto.clear()
-    _tickets.clear()
+    global _auto, _ticket
+    _auto, _ticket = 0, None
     _phantom_sets.clear()
-    for cancel in _running.values():
-        cancel.set()
+    if _run is not None:
+        _run.cancel.set()
 
 
 class Stats:
@@ -296,51 +295,96 @@ def page(all_stats, cancelled, auto):
             + "".join(card(s, cancelled) for s in all_stats) + "</body>")
 
 
-def find_view(window):
-    return next((v for v in window.views() if v.name() == VIEW_NAME), None)
+class Run:
+    """One stats request: the paths, a Stats per path and the Event that stops them."""
+
+    def __init__(self, paths):
+        self.paths = list(paths)
+        self.stats = [Stats(p) for p in paths]
+        self.cancel = threading.Event()
+
+    def finished(self):
+        return self.cancel.is_set() or all(s.done for s in self.stats)
 
 
-def open_view(window, focus=True):
-    """Find or create the stats tab. A new tab goes to another group when there is one, so it
-    never covers the tab the user is working in; focus=False hands the keyboard back."""
-    view = find_view(window)
-    if view is not None:
-        if focus:
-            window.focus_view(view)
-        return view
-    group, previous = window.active_group(), window.active_view()
-    view = window.new_file()
+def walk_all(run):
+    for s in run.stats:
+        if run.cancel.is_set():
+            break
+        work(s, run.cancel)
+
+
+def find_view():
+    """The stats view, in whichever window it lives."""
+    for window in sublime.windows():
+        for view in window.views():
+            if view.name() == VIEW_NAME:
+                return view
+    return None
+
+
+def make_view(window):
+    """Turn a new window into the stats window: one tab, no tab bar, sidebar or minimap."""
+    view = next((v for v in window.views() if v.file_name() is None and v.size() == 0 and not v.name()), None)
+    view = view or window.new_file()
     view.set_name(VIEW_NAME)
     view.set_scratch(True)
     view.set_read_only(True)
     for key, value in (("gutter", False), ("line_numbers", False), ("word_wrap", True),
                        ("draw_white_space", "none")):
         view.settings().set(key, value)
-    if window.num_groups() > 1:
-        window.set_view_index(view, (group + 1) % window.num_groups(), 0)
-    window.focus_view(view)  # make it the selected tab of its group
-    if not focus:
-        window.focus_group(group)
-        if previous is not None:
-            window.focus_view(previous)
+    window.set_tabs_visible(False)
+    window.set_sidebar_visible(False)
+    window.set_minimap_visible(False)
     return view
 
 
-def is_shown(window, view):
-    """True when the stats tab is the selected tab of its group."""
-    group, _ = window.get_view_index(view)
-    selected = window.active_view_in_group(group)
-    return selected is not None and selected.id() == view.id()
+def open_window(then):
+    """Open a new window and call then(view) once it exists; new_window returns before it does."""
+    known = {w.id() for w in sublime.windows()}
+    sublime.run_command("new_window")
+
+    def poll(tries):
+        fresh = [w for w in sublime.windows() if w.id() not in known]
+        if fresh:
+            then(make_view(fresh[0]))
+        elif tries:
+            sublime.set_timeout(lambda: poll(tries - 1), 50)
+        else:
+            sublime.status_message("FileDirStats: could not open its window")
+            if _run is not None:
+                _run.cancel.set()
+    poll(60)
 
 
-def draw(view, all_stats, cancel):
-    window = view.window()
-    auto = _auto.get(window.id(), 0) if window else 0
+def draw(view):
+    run = _run
+    if run is None:
+        return
+    for stale in [vid for vid in _phantom_sets if vid != view.id()]:
+        del _phantom_sets[stale]
     phantom_set = _phantom_sets.get(view.id())
     if phantom_set is None:
         phantom_set = _phantom_sets[view.id()] = sublime.PhantomSet(view, "file_dir_stats")
-    phantom_set.update([sublime.Phantom(sublime.Region(0, 0), page(all_stats, cancel.is_set(), auto),
+    phantom_set.update([sublime.Phantom(sublime.Region(0, 0), page(run.stats, run.cancel.is_set(), _auto),
                                         sublime.LAYOUT_BLOCK, lambda href: navigate(view, href))])
+
+
+def redraw(run):
+    """Redraw once a second while the walk runs; ends when a newer run takes over."""
+    if run is not _run:
+        return
+    view = find_view()
+    if view is None:
+        run.cancel.set()  # the window was closed: stop walking
+        return
+    draw(view)
+    if run.cancel.is_set():
+        return
+    if all(s.done for s in run.stats):
+        sublime.status_message("FileDirStats: done")
+    else:
+        sublime.set_timeout(lambda: redraw(run), REFRESH_MS)
 
 
 def navigate(view, href):
@@ -348,27 +392,29 @@ def navigate(view, href):
     window = view.window()
     if window is None:
         return
-    last = _last.get(window.id())
+    run = _run
     if href == "refresh":
         window.run_command("file_dir_stats_refresh")
-    elif href == "cancel" and last:
-        last[2].set()
-        draw(view, last[1], last[2])
+    elif href == "cancel" and run:
+        run.cancel.set()
+        draw(view)
     elif href == "auto":
         window.run_command("file_dir_stats_auto_refresh")
-        if last:
-            draw(view, last[1], last[2])
-    elif href == "copy" and last:
-        sublime.set_clipboard("\n\n".join(render(s, last[2].is_set()) for s in last[1]))
+    elif href == "copy" and run:
+        sublime.set_clipboard("\n\n".join(render(s, run.cancel.is_set()) for s in run.stats))
         sublime.status_message("FileDirStats: copied to clipboard")
     elif href == "close":
-        if last:
-            last[2].set()
-        view.close()
+        if run:
+            run.cancel.set()
+        if len(sublime.windows()) > 1:
+            window.run_command("close_window")
+        else:
+            view.close()  # closing the only window would quit Sublime
 
 
 class FileDirStatsCommand(sublime_plugin.WindowCommand):
     def run(self, paths=None, focus=True):
+        global _run
         if not paths:
             view = self.window.active_view()
             name = view.file_name() if view else None
@@ -376,34 +422,27 @@ class FileDirStatsCommand(sublime_plugin.WindowCommand):
         if not paths:
             sublime.status_message("FileDirStats: nothing selected")
             return
-        old = _running.get(self.window.id())
-        if old:
-            old.set()
-        cancel = threading.Event()
-        _running[self.window.id()] = cancel
-        all_stats = [Stats(p) for p in paths]
-        _last[self.window.id()] = (list(paths), all_stats, cancel)
-        threading.Thread(target=self.work_all, args=(all_stats, cancel), daemon=True).start()
-        self.show(all_stats, cancel, first=True, focus=focus)
-
-    def work_all(self, all_stats, cancel):
-        for s in all_stats:
-            if cancel.is_set():
-                break
-            work(s, cancel)
-
-    def show(self, all_stats, cancel, first=False, focus=True):
-        if cancel.is_set() and not first:
-            return  # a newer run or the Cancel button took over; they draw their own state
-        view = open_view(self.window, focus) if first else find_view(self.window)
+        if _run:
+            _run.cancel.set()
+        run = _run = Run(paths)
+        threading.Thread(target=walk_all, args=(run,), daemon=True).start()
+        view = find_view()
         if view is None:
-            cancel.set()  # the tab was closed: stop walking
-            return
-        draw(view, all_stats, cancel)
-        if all(s.done for s in all_stats):
-            sublime.status_message("FileDirStats: done")
+            previous = sublime.active_window()
+            open_window(lambda v: self.begin(run, v, focus, previous))
         else:
-            sublime.set_timeout(lambda: self.show(all_stats, cancel), REFRESH_MS)  # redraw only
+            self.begin(run, view, focus, None)
+
+    def begin(self, run, view, focus, previous):
+        if run is not _run:
+            return  # replaced while the window was opening
+        draw(view)
+        window = view.window()
+        if window is not None and focus:
+            window.bring_to_front()
+        elif previous is not None:
+            previous.bring_to_front()  # a new window takes the keyboard; give it back
+        sublime.set_timeout(lambda: redraw(run), REFRESH_MS)
 
     def is_visible(self, paths=None):
         if paths:
@@ -416,45 +455,38 @@ class FileDirStatsRefreshCommand(sublime_plugin.WindowCommand):
     """Run the latest stats again on the same paths."""
 
     def run(self, focus=True):
-        last = _last.get(self.window.id())
-        if not last:
+        if _run is None:
             sublime.status_message("FileDirStats: nothing to refresh")
             return
-        self.window.run_command("file_dir_stats", {"paths": last[0], "focus": focus})
+        self.window.run_command("file_dir_stats", {"paths": _run.paths, "focus": focus})
 
     def is_enabled(self):
-        return self.window.id() in _last
+        return _run is not None
 
 
 class FileDirStatsAutoRefreshCommand(sublime_plugin.WindowCommand):
-    """Toggle a timer that refreshes the stats while the panel is showing."""
+    """Toggle a timer that refreshes the stats while the stats window is open."""
 
     def run(self, seconds=AUTO_SECONDS):
-        wid = self.window.id()
-        if wid in _auto:
-            del _auto[wid]
-            _tickets.pop(wid, None)
+        global _auto, _ticket
+        if _auto:
+            _auto, _ticket = 0, None
             sublime.status_message("FileDirStats: auto refresh off")
-            return
-        _auto[wid] = max(1, seconds)
-        ticket = _tickets[wid] = object()  # an older timer chain sees a different ticket and ends
-        sublime.status_message("FileDirStats: auto refresh every %d s" % _auto[wid])
-        sublime.set_timeout(lambda: self.tick(wid, ticket), _auto[wid] * 1000)
+        else:
+            _auto = max(1, seconds)
+            ticket = _ticket = object()  # an older timer chain sees a different ticket and ends
+            sublime.status_message("FileDirStats: auto refresh every %d s" % _auto)
+            sublime.set_timeout(lambda: self.tick(ticket), _auto * 1000)
+        view = find_view()
+        if view is not None:
+            draw(view)  # the button shows the new state
 
-    def tick(self, wid, ticket):
-        if _tickets.get(wid) is not ticket:
+    def tick(self, ticket):
+        if _ticket is not ticket:
             return
-        window = next((w for w in sublime.windows() if w.id() == wid), None)
-        if window is None:
-            _auto.pop(wid, None)
-            _tickets.pop(wid, None)
-            return
-        last = _last.get(wid)
-        finished = last and (last[2].is_set() or all(s.done for s in last[1]))
-        view = find_view(window)
-        if finished and view is not None and is_shown(window, view):
-            window.run_command("file_dir_stats_refresh", {"focus": False})
-        sublime.set_timeout(lambda: self.tick(wid, ticket), _auto.get(wid, AUTO_SECONDS) * 1000)
+        if _run is not None and _run.finished() and find_view() is not None:
+            sublime.active_window().run_command("file_dir_stats_refresh", {"focus": False})
+        sublime.set_timeout(lambda: self.tick(ticket), (_auto or AUTO_SECONDS) * 1000)
 
     def is_checked(self):
-        return self.window.id() in _auto
+        return bool(_auto)
