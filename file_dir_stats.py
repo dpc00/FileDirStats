@@ -10,7 +10,8 @@ import sublime_plugin
 
 VIEW_NAME = "File/Folder Stats"
 REFRESH_MS = 1000  # how often the view redraws while a walk is running
-LOG_SHOWN = 50
+LOG_SHOWN = 50  # error lines shown
+SKIPS_SHOWN = 10  # skipped-link lines shown
 LARGEST_SHOWN = 20  # files listed under "Largest"
 REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: junctions and symlinks on Windows
 
@@ -108,6 +109,13 @@ def reason(err):
     return "[WinError %s] %s" % (winerror, err.strerror) if winerror else str(err.strerror or err)
 
 
+def split_log(log):
+    """Errors first matter most: a few hundred skipped links must not push them out of view."""
+    entries = list(log)
+    errors = [l for l in entries if "  ERROR " in l]
+    return errors, [l for l in entries if "  ERROR " not in l]
+
+
 def walk(stats, cancel):
     stack = [extended(stats.path)]
     while stack and not cancel.is_set():
@@ -180,14 +188,16 @@ def render(stats, cancelled=False):
             "Size:      %s (%d bytes)" % (human(stats.size), stats.size),
             "Modified:  " + stamp(stats.st.st_mtime),
         ] + created_line(stats.st)
-    log = list(stats.log)
-    errors = sum(1 for l in log if "  ERROR " in l)
-    if log:
+    errors, skips = split_log(stats.log)
+    if errors or skips:
         lines.append("")
-        lines.append("Log (%d errors, %d links skipped):" % (errors, stats.skipped))
-        if len(log) > LOG_SHOWN:
-            lines.append("  ... %d earlier entries not shown" % (len(log) - LOG_SHOWN))
-        lines += ["  " + l for l in log[-LOG_SHOWN:]]
+        lines.append("Log (%d errors, %d links skipped):" % (len(errors), stats.skipped))
+        if len(errors) > LOG_SHOWN:
+            lines.append("  ... %d earlier errors not shown" % (len(errors) - LOG_SHOWN))
+        lines += ["  " + l for l in errors[-LOG_SHOWN:]]
+        if len(skips) > SKIPS_SHOWN:
+            lines.append("  ... %d earlier skipped links not shown" % (len(skips) - SKIPS_SHOWN))
+        lines += ["  " + l for l in skips[-SKIPS_SHOWN:]]
     return "\n".join(lines)
 
 
@@ -265,14 +275,17 @@ def card(stats, cancelled):
                     h.append('<div><span class="sz">%s</span> <span style="background-color:#66d9ef;">%s</span></div>'
                              % (human(size), "&nbsp;" * n))
                     h.append('<div class="fp">%s</div>' % escape(os.path.relpath(path, stats.path)))
-    log = list(stats.log)
-    if log:
-        errors = sum(1 for l in log if "  ERROR " in l)
-        h.append('<div class="sec">Log &mdash; %d errors, %d links skipped</div>' % (errors, stats.skipped))
-        if len(log) > LOG_SHOWN:
-            h.append('<div class="hint">%d earlier entries not shown</div>' % (len(log) - LOG_SHOWN))
-        for line in log[-LOG_SHOWN:]:
-            h.append('<div class="%s">%s</div>' % ("err" if "  ERROR " in line else "skip", escape(line)))
+    errors, skips = split_log(stats.log)
+    if errors or skips:
+        h.append('<div class="sec">Log &mdash; %d errors, %d links skipped</div>' % (len(errors), stats.skipped))
+        if len(errors) > LOG_SHOWN:
+            h.append('<div class="hint">%d earlier errors not shown</div>' % (len(errors) - LOG_SHOWN))
+        for line in errors[-LOG_SHOWN:]:
+            h.append('<div class="err">%s</div>' % escape(line))
+        if len(skips) > SKIPS_SHOWN:
+            h.append('<div class="hint">%d earlier skipped links not shown</div>' % (len(skips) - SKIPS_SHOWN))
+        for line in skips[-SKIPS_SHOWN:]:
+            h.append('<div class="skip">%s</div>' % escape(line))
     h.append("</div>")
     return "".join(h)
 
