@@ -1,5 +1,6 @@
 import heapq
 import os
+import re
 import stat
 import threading
 import time
@@ -102,6 +103,27 @@ def plain(path):
     return path
 
 
+WSL_ROOT_DIR = re.compile(r"^\\\\(?:wsl\.localhost|wsl\$)\\[^\\]+\\(proc|sys|dev|mnt)$", re.IGNORECASE)
+NOT_STORAGE = {
+    "proc": "kernel pseudo filesystem, its file sizes are not real (/proc/kcore reports 128 TB)",
+    "sys": "kernel pseudo filesystem, not real storage",
+    "dev": "device files, not real storage",
+    "mnt": "Windows drives mounted in WSL, scan them from Windows instead",
+}
+
+
+def not_storage(path):
+    """Why a folder is not walked, or None. Only the top-level proc, sys, dev and mnt of a
+    WSL share (\\\\wsl.localhost\\<distro>\\...) or of a Linux root are matched."""
+    p = plain(path).rstrip("\\/")
+    m = WSL_ROOT_DIR.match(p)
+    if m:
+        return NOT_STORAGE[m.group(1).lower()]
+    if os.name != "nt" and p in ("/proc", "/sys", "/dev", "/mnt"):
+        return NOT_STORAGE[p[1:]]
+    return None
+
+
 def reason(err):
     """What went wrong without repeating the path, which the log line already shows."""
     winerror = getattr(err, "winerror", None)
@@ -130,6 +152,11 @@ def walk(stats, cancel):
                             stats.skipped += 1
                             stats.note("SKIP", plain(e.path), "link or junction, not followed")
                         elif e.is_dir(follow_symlinks=False):
+                            skip_reason = not_storage(e.path)
+                            if skip_reason:
+                                stats.skipped += 1
+                                stats.note("SKIP", plain(e.path), skip_reason)
+                                continue
                             stats.dirs += 1
                             stack.append(e.path)
                         else:
@@ -190,12 +217,12 @@ def render(stats, cancelled=False):
     errors, skips = split_log(stats.log)
     if errors or skips:
         lines.append("")
-        lines.append("Log (%d errors, %d links skipped):" % (len(errors), stats.skipped))
+        lines.append("Log (%d errors, %d skipped):" % (len(errors), stats.skipped))
         if len(errors) > LOG_SHOWN:
             lines.append("  ... %d earlier errors not shown" % (len(errors) - LOG_SHOWN))
         lines += ["  " + l for l in errors[-LOG_SHOWN:]]
         if len(skips) > SKIPS_SHOWN:
-            lines.append("  ... %d earlier skipped links not shown" % (len(skips) - SKIPS_SHOWN))
+            lines.append("  ... %d earlier skipped items not shown" % (len(skips) - SKIPS_SHOWN))
         lines += ["  " + l for l in skips[-SKIPS_SHOWN:]]
     return "\n".join(lines)
 
@@ -276,13 +303,13 @@ def card(stats, cancelled):
                     h.append('<div class="fp">%s</div>' % escape(os.path.relpath(path, stats.path)))
     errors, skips = split_log(stats.log)
     if errors or skips:
-        h.append('<div class="sec">Log &mdash; %d errors, %d links skipped</div>' % (len(errors), stats.skipped))
+        h.append('<div class="sec">Log &mdash; %d errors, %d skipped</div>' % (len(errors), stats.skipped))
         if len(errors) > LOG_SHOWN:
             h.append('<div class="hint">%d earlier errors not shown</div>' % (len(errors) - LOG_SHOWN))
         for line in errors[-LOG_SHOWN:]:
             h.append('<div class="err">%s</div>' % escape(line))
         if len(skips) > SKIPS_SHOWN:
-            h.append('<div class="hint">%d earlier skipped links not shown</div>' % (len(skips) - SKIPS_SHOWN))
+            h.append('<div class="hint">%d earlier skipped items not shown</div>' % (len(skips) - SKIPS_SHOWN))
         for line in skips[-SKIPS_SHOWN:]:
             h.append('<div class="skip">%s</div>' % escape(line))
     h.append("</div>")

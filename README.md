@@ -9,6 +9,9 @@ counts, newest modified time and the 20 largest files with size bars.
 - Problems (unreadable entries) and skipped links or junctions are listed in a coloured,
   timestamped log under the numbers, with counts in its heading. Links and junctions are
   not followed.
+- On a WSL share (`\\wsl.localhost\<distro>`) or a Linux root, the top-level `proc`, `sys`,
+  `dev` and `mnt` folders are skipped and logged: the kernel's pseudo files report fake
+  sizes (`/proc/kcore` is 128 TB) and `mnt` holds your Windows drives again.
 - Running it again cancels the walk in progress and reuses the same window.
 - Auto refresh never takes the keyboard focus from the window you are working in.
 - **Close** closes the stats window (it never closes the last window of Sublime Text).
