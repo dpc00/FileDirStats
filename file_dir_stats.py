@@ -10,6 +10,7 @@ import sublime_plugin
 PANEL = "file_dir_stats"
 REFRESH_MS = 1000  # how often the panel redraws while a walk is running
 LOG_SHOWN = 50
+LARGEST_SHOWN = 20  # files listed under "Largest"
 REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: junctions and symlinks on Windows
 
 AUTO_SECONDS = 10
@@ -57,7 +58,7 @@ class Stats:
         self.is_dir = False
         self.size = self.files = self.dirs = 0
         self.newest = 0
-        self.largest = []  # min-heap of (size, path), at most 5
+        self.largest = []  # min-heap of (size, path), at most LARGEST_SHOWN
         self.skipped = 0
         self.log = []
         self.done = False
@@ -72,7 +73,7 @@ class Stats:
         self.files += 1
         self.size += size
         self.newest = max(self.newest, mtime)
-        if len(self.largest) < 5:
+        if len(self.largest) < LARGEST_SHOWN:
             heapq.heappush(self.largest, (size, path))
         else:
             heapq.heappushpop(self.largest, (size, path))
